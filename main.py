@@ -360,10 +360,28 @@ def extract_entities(text):
         common_responses = ["yes", "no", "okay", "sure", "correct", "right", "thanks", "thank", "please"]
         # Check for time patterns that should not be treated as names
         time_patterns = [r'^\d{1,2}:\d{2}$', r'^\d{1,2}(am|pm|a\.m\.|p\.m\.)$', r'^\d{1,2}\s*(am|pm|a\.m\.|p\.m\.)$']
+        # Add more common words that shouldn't be treated as person names
+        common_words = ["feeling", "anytime", "anything", "something", "nothing", "anyone", "someone", 
+                       "nobody", "everybody", "everyone", "whenever", "whatever", "however", "anywhere", 
+                       "going", "looking", "thinking", "trying", "hoping", "planning", "wanting", "needing",
+                       "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                       "first", "second", "third", "fourth", "fifth", "last", "next", "this", "that",
+                       "these", "those", "there", "here", "today", "tomorrow", "yesterday",
+                       "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        
+        # Check for singular capitalized word at beginning of sentence (likely not a person)
+        if len(text.split()) > 2 and text.strip().startswith(result["person"]) and len(result["person"].split()) == 1:
+            print(f"[ENTITY EXTRACTION] Ignoring capitalized first word as person name: {result['person']}")
+            result["person"] = None
         
         # Check if the person is a common response
-        if result["person"].lower() in common_responses:
+        elif result["person"].lower() in common_responses:
             print(f"[ENTITY EXTRACTION] Ignoring common response as person name: {result['person']}")
+            result["person"] = None
+        
+        # Check if the person is a common word that shouldn't be treated as a name
+        elif result["person"].lower() in common_words:
+            print(f"[ENTITY EXTRACTION] Ignoring common word as person name: {result['person']}")
             result["person"] = None
         
         # Check if the person matches a time pattern
@@ -563,7 +581,8 @@ def check_if_summary_requested(text):
 
 async def extract_entities_with_ai(text, missing_entities):
     """Use the LLM to extract entities from text when regular extraction fails"""
-    # Only use AI extraction for specific follow-up questions, not initial queries
+    print(f"[AI EXTRACTION] Attempting to extract {missing_entities} from text: '{text}'")
+    
     entities_to_extract = ", ".join(missing_entities)
     
     prompt = f"""
@@ -571,21 +590,31 @@ async def extract_entities_with_ai(text, missing_entities):
     Text: "{text}"
     
     Format your response as valid JSON with these keys: {json.dumps(missing_entities)}
-    If an entity is not present in the text, set its value to NULL (not a string "NULL").
+    If an entity is not present in the text, set its value to null or "unknown" (not a string "NULL").
     
     Important guidelines:
-    - Dates should be in YYYY-MM-DD format
-    - Times should be in 24-hour HH:MM format
-    - If text contains only a date (like "July 25"), don't extract it as a time
-    - If text contains only a time (like "5pm"), don't extract it as a date
+    - For "person": Extract the name of the person to meet with, doctor name, or other contact.
+      - If the text mentions "doctor" or "physician", use "Doctor" as the person
+      - If no specific person is mentioned, return null for person
+      - Do not extract common words like "one", "that", "available", "anytime", etc. as person names
+    
+    - For "date": Extract appointment or meeting date
+      - Dates should be in "Month Day, Year" format (e.g., "June 30, 2025")
+      - If text contains only a date (like "July 25"), don't extract it as a time
+      - For relative dates like "tomorrow" or "next Monday", do your best to translate them
+    
+    - For "time": Extract appointment or meeting time
+      - Times should be in standard 12-hour format with AM/PM (e.g., "3:30 PM")
+      - If text contains only a time (like "5pm"), don't extract it as a date
+      - If text mentions "anytime", "whenever available", or similar, extract as "first available"
     
     Example response format:
     ```json
-    {{
+    {
       "person": "John Smith",
-      "date": "2023-05-15",
-      "time": NULL
-    }}
+      "date": "June 15, 2023",
+      "time": "3:30 PM"
+    }
     ```
     
     Only return the JSON, nothing else.
@@ -602,13 +631,38 @@ async def extract_entities_with_ai(text, missing_entities):
         else:
             json_str = content
         
+        # Clean up common issues with JSON parsing
+        # Replace any single quotes with double quotes for JSON compatibility
+        json_str = json_str.replace("'", '"')
+        
+        # Fix common null issues
+        json_str = json_str.replace('"NULL"', 'null')
+        json_str = json_str.replace('"null"', 'null')
+        json_str = json_str.replace('NULL', 'null')
+        
         print(f"[AI EXTRACTION] Response: {json_str}")
-        result = json.loads(json_str)
+        
+        try:
+            result = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Fall back to regex extraction if JSON parsing fails
+            print("[AI EXTRACTION] JSON parsing failed, falling back to regex extraction")
+            result = {}
+            
+            for entity in missing_entities:
+                # Extract pattern like "person": "John Smith" or "date": null
+                pattern = f'"{entity}"\\s*:\\s*(?:"([^"]*?)"|null)'
+                match = re.search(pattern, json_str)
+                if match and match.group(1):
+                    result[entity] = match.group(1)
+                else:
+                    result[entity] = None
         
         # Convert any "NULL" strings to None
         for key in result:
-            if result[key] == "NULL" or result[key] == "null":
-                result[key] = None
+            if isinstance(result[key], str):
+                if result[key].lower() in ["null", "unknown", ""]:
+                    result[key] = None
             
             # Validate that date doesn't look like a time
             if key == "date" and result[key] is not None:
@@ -622,10 +676,22 @@ async def extract_entities_with_ai(text, missing_entities):
                             str(result[key]).lower()) or re.search(r'\d{4}-\d{2}-\d{2}', str(result[key])):
                     print(f"[AI EXTRACTION] Rejected time value that looks like a date: {result[key]}")
                     result[key] = None
+                
+                # Convert flexible time expressions to a standard format
+                if result[key] and any(phrase in result[key].lower() for phrase in 
+                                      ["anytime", "any time", "whenever", "available", "asap", "as soon as", "earliest"]):
+                    result[key] = "first available"
+                    print(f"[AI EXTRACTION] Converted flexible time expression to: {result[key]}")
         
+        # Ensure all missing entities are in the result
+        for entity in missing_entities:
+            if entity not in result:
+                result[entity] = None
+                
+        print(f"[AI EXTRACTION] Final extracted entities: {result}")
         return result
     except Exception as e:
-        print(f"[AI EXTRACTION] Failed to parse JSON: {e}")
+        print(f"[AI EXTRACTION] Error: {e}")
         return {entity: None for entity in missing_entities}
 
 async def process_appointment_intent(message_text, context, session_id=None):
@@ -635,6 +701,30 @@ async def process_appointment_intent(message_text, context, session_id=None):
     response = ""
     
     print(f"[PROCESS_INTENT] Processing with phase: {phase}, intent: {intent}, context: {context}")
+    
+    # Check for special time expressions when in asking_time phase
+    if phase == "asking_time" and "time" not in context:
+        # Look for special time expressions
+        anytime_patterns = [
+            r"any\s*time",
+            r"when\w*\s+available",
+            r"earliest\s+available",
+            r"first\s+available",
+            r"whenever",
+            r"any\s+open\w*\s+slot",
+            r"any\s+opening",
+            r"as\s+soon\s+as\s+possible",
+            r"asap",
+            r"fit\s+me\s+in",
+            r"earliest\s+appointment"
+        ]
+        
+        for pattern in anytime_patterns:
+            if re.search(pattern, message_text.lower()):
+                print(f"[PROCESS_INTENT] Detected flexible time expression: '{message_text}'")
+                context["time"] = "first available"
+                print(f"[PROCESS_INTENT] Set time to 'first available'")
+                break
     
     # Check for "cancel this appointment" or "cancel current appointment" patterns
     cancel_current_patterns = [
@@ -967,6 +1057,10 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
     if context is None:
         context = {}
     
+    # Store original valid values that we don't want to override
+    original_person = context.get("person")
+    original_phase = context.get("phase")
+    
     # Initialize context if needed
     if "intent" not in context:
         intent = identify_intent(message_text)
@@ -1057,6 +1151,14 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
                 print(f"[ENTITY EXTRACTION] Ignoring domain word as person: {value}")
                 continue
                 
+            # Don't override 'person' if we're already past the person-asking phase 
+            # and the new person entity looks suspicious
+            if (key == "person" and 
+                original_person is not None and 
+                original_phase not in ["init", "asking_person", "asking_person_cancel", "asking_person_check"]):
+                print(f"[ENTITY EXTRACTION] Not overriding existing person '{original_person}' with '{value}' in phase '{original_phase}'")
+                continue
+                
             context[key] = value
             print(f"[CONTEXT] Updated {key} = {value}")
             if session_id:
@@ -1065,9 +1167,9 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
                     memory["entities"][session_id][key].append(value)
                     print(f"[MEMORY] Stored {key} = {value} in memory")
     
-    # Only use AI extraction if we're in a follow-up phase and standard extraction failed
-    # This ensures we don't use AI extraction for initial queries
-    if missing_entities and context.get("phase") and context.get("phase") not in ["init", None]:
+    # Always try AI extraction if there are any missing entities
+    # This ensures we get as much information as possible from each message
+    if missing_entities:
         try:
             print(f"[AI EXTRACTION] Using AI to extract missing entities: {missing_entities}")
             ai_entities = await extract_entities_with_ai(message_text, missing_entities)
@@ -1082,6 +1184,13 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
                     ):
                         print(f"[AI EXTRACTION] Rejected {key} = {ai_entities[key]} (looks like date/time)")
                         continue
+                    
+                    # Don't override 'person' if we're already past the person-asking phase
+                    if (key == "person" and 
+                        original_person is not None and 
+                        original_phase not in ["init", "asking_person", "asking_person_cancel", "asking_person_check"]):
+                        print(f"[AI EXTRACTION] Not overriding existing person '{original_person}' with '{ai_entities[key]}' in phase '{original_phase}'")
+                        continue
                         
                     context[key] = ai_entities[key]
                     print(f"[AI EXTRACTION] Added {key} = {ai_entities[key]}")
@@ -1094,7 +1203,7 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
                             print(f"[MEMORY] Added entity {key}: {ai_entities[key]}")
         except Exception as e:
             print(f"[AI EXTRACTION] Error: {e}")
-    
+            
     # Add topics to memory
     if session_id:
         topics = extract_topics_from_text(message_text)
@@ -1103,7 +1212,6 @@ async def handle_appointment_query(message_text, context=None, session_id=None, 
             print(f"[MEMORY] Added topic: {topic}")
     
     # Process the appointment request based on intent and available entities
-    # Now process the appointment intent
     response, updated_context = await process_appointment_intent(message_text, context, session_id)
     
     # Update the context with any changes from processing
@@ -1228,6 +1336,9 @@ async def process_message(message_text, conversation_context=None, session_id=No
     if conversation_context is None:
         conversation_context = {}
     
+    # Save original context values to check for unwanted overrides later
+    original_person = conversation_context.get("person")
+    
     print(f"[PROCESS] Received message: '{message_text}' with context: {conversation_context}")
     
     if not message_text:
@@ -1237,6 +1348,18 @@ async def process_message(message_text, conversation_context=None, session_id=No
     if check_if_summary_requested(message_text):
         summary = generate_conversation_summary(session_id)
         return {"response": summary, "context": conversation_context, "session_id": session_id}
+    
+    # Special case handling for seeing a doctor
+    if ("see a doctor" in message_text.lower() or 
+        "see the doctor" in message_text.lower() or 
+        "need a doctor" in message_text.lower() or 
+        "need to see a doctor" in message_text.lower()):
+        print("[PROCESS] Detected request to see a doctor")
+        # Set intent to schedule appointment
+        conversation_context["intent"] = "schedule_appointment"
+        # Set person to "Doctor"
+        conversation_context["person"] = "Doctor"
+        print("[PROCESS] Auto-set person to 'Doctor'")
     
     # Check for users explicitly trying to change the intent
     text_lower = message_text.lower()
